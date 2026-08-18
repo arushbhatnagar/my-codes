@@ -1,0 +1,49 @@
+import time
+import requests
+import pandas as pd
+
+def run_redash_query(query, data_source_id=44, max_poll=30, poll_interval=2):
+    """Run a query against Redash and return a DataFrame of results."""
+    resp = requests.post(
+        f"{REDASH_BASE_URL}/api/query_results",
+        headers=headers,
+        cookies=cookies,
+        json={"query": query, "data_source_id": data_source_id},
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Query submit failed: {resp.status_code} {resp.text[:300]}")
+
+    body = resp.json()
+
+    # Cached result comes back immediately
+    if "query_result" in body:
+        return pd.DataFrame(body["query_result"]["data"]["rows"])
+
+    job_id = body["job"]["id"]
+
+    for _ in range(max_poll):
+        time.sleep(poll_interval)
+        poll = requests.get(
+            f"{REDASH_BASE_URL}/api/jobs/{job_id}",
+            headers=headers,
+            cookies=cookies,
+            timeout=15,
+        )
+        job = poll.json()["job"]
+
+        if job["status"] == 3:  # success
+            result_id = job["query_result_id"]
+            result_resp = requests.get(
+                f"{REDASH_BASE_URL}/api/query_results/{result_id}",
+                headers=headers,
+                cookies=cookies,
+                timeout=15,
+            )
+            rows = result_resp.json()["query_result"]["data"]["rows"]
+            return pd.DataFrame(rows)
+
+        elif job["status"] == 4:  # failed
+            raise RuntimeError(f"Query failed: {job.get('error')}")
+
+    raise TimeoutError("Query did not finish in time")

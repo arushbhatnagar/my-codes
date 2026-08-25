@@ -1,0 +1,60 @@
+"""
+DAILY BOILERPLATE - run this one cell first, every session.
+Reloads everything needed: cached traces, labeled dataset, Redash auth/helper.
+"""
+import os, pickle, time
+import pandas as pd
+import numpy as np
+import requests
+from dotenv import load_dotenv
+
+# --- paths ---
+os.chdir("/Users/arushbhatnagar/Downloads/fw-ds")
+
+# --- cached firmware traces (the big pickle - your accumulated dataset) ---
+with open("all_traces_combined.pkl", "rb") as f:
+    all_traces_combined = pickle.load(f)
+print(f"Loaded {len(all_traces_combined)} cached traces")
+
+# --- full 3-month labeled dataset (for user_id/date_str lookups) ---
+df_full = pd.read_csv("workouts_nonplus_3months.csv")
+df_full['activity_subtype'] = df_full['activity_subtype'].fillna("__NO_SUBTYPE__")
+df_full['date_str'] = pd.to_datetime(df_full['start_time_ms'].astype('int64'), unit='ms').dt.strftime('%Y-%m-%d')
+print(f"df_full rebuilt: {len(df_full)} rows")
+
+# --- Redash auth ---
+load_dotenv(override=True)
+REDASH_BASE_URL = os.getenv("REDASH_BASE_URL", "https://redash.t.pw").rstrip("/")
+REDASH_API_KEY = os.getenv("REDASH_API_KEY", "")
+BubbleAppCookie = os.getenv("BubbleAppCookie", "")
+BROWSER_USER_AGENT = os.getenv("FW_DS_USER_AGENT", "")
+headers = {"Authorization": f"Key {REDASH_API_KEY}", "User-Agent": BROWSER_USER_AGENT}
+cookies = {"BubbleAppCookie": BubbleAppCookie}
+
+def run_redash_query_verbose(query, headers, cookies, base_url, data_source_id=44, max_poll=150, poll_interval=3, submit_timeout=60):
+    resp = requests.post(f"{base_url}/api/query_results", headers=headers, cookies=cookies,
+                          json={"query": query, "data_source_id": data_source_id}, timeout=submit_timeout)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Query submit failed: {resp.status_code} {resp.text[:300]}")
+    body = resp.json()
+    if "query_result" in body:
+        return pd.DataFrame(body["query_result"]["data"]["rows"])
+    job_id = body["job"]["id"]
+    for i in range(max_poll):
+        time.sleep(poll_interval)
+        poll = requests.get(f"{base_url}/api/jobs/{job_id}", headers=headers, cookies=cookies, timeout=30)
+        job = poll.json()["job"]
+        status = job["status"]
+        if status == 3:
+            result_id = job["query_result_id"]
+            result_resp = requests.get(f"{base_url}/api/query_results/{result_id}", headers=headers, cookies=cookies, timeout=30)
+            return pd.DataFrame(result_resp.json()["query_result"]["data"]["rows"])
+        elif status == 4:
+            raise RuntimeError(f"Query failed: {job.get('error')}")
+    raise TimeoutError(f"Query did not finish within {max_poll * poll_interval}s")
+
+test_resp = requests.post(f"{REDASH_BASE_URL}/api/query_results", headers=headers, cookies=cookies,
+                           json={"query": "SELECT 1 AS test", "data_source_id": 44}, timeout=30)
+print("Auth OK" if "application/json" in test_resp.headers.get("Content-Type","") else "COOKIE STALE - refresh .env before running Redash queries")
+
+print("\nBoilerplate loaded. Ready to go.")

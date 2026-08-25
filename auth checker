@@ -1,0 +1,22 @@
+import os, requests
+from dotenv import load_dotenv
+
+os.chdir("/Users/arushbhatnagar/Downloads/fw-ds")
+load_dotenv(override=True)
+
+REDASH_BASE_URL = os.getenv("REDASH_BASE_URL", "https://redash.t.pw").rstrip("/")
+REDASH_API_KEY = os.getenv("REDASH_API_KEY", "")
+BubbleAppCookie = os.getenv("BubbleAppCookie", "")
+BROWSER_USER_AGENT = os.getenv("FW_DS_USER_AGENT", "")
+headers = {"Authorization": f"Key {REDASH_API_KEY}", "User-Agent": BROWSER_USER_AGENT}
+cookies = {"BubbleAppCookie": BubbleAppCookie}
+
+resp = requests.post(
+    f"{REDASH_BASE_URL}/api/query_results",
+    headers=headers, cookies=cookies,
+    json={"query": "SELECT 1 AS test", "data_source_id": 44},
+    timeout=30
+)
+print("Auth OK" if "application/json" in resp.headers.get("Content-Type","") else "STILL STALE")
+
+#sed -i '' 's/^BubbleAppCookie=.*/BubbleAppCookie=PASTE_FRESH_VALUE_HERE/' /Users/arushbhatnagar/Downloads/fw-ds/.env

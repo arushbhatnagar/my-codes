@@ -1,0 +1,141 @@
+import os, pickle, time
+import pandas as pd
+
+os.chdir("/Users/arushbhatnagar/Downloads/fw-ds")
+
+with open("all_traces_combined.pkl", "rb") as f:
+    all_traces_combined = pickle.load(f)
+print(f"Loaded {len(all_traces_combined)} cached traces")
+
+df_full = pd.read_csv("workouts_nonplus_3months.csv")
+df_full['activity_subtype'] = df_full['activity_subtype'].fillna("__NO_SUBTYPE__")
+df_full['date_str'] = pd.to_datetime(df_full['start_time_ms'].astype('int64'), unit='ms').dt.strftime('%Y-%m-%d')
+print(f"df_full rebuilt: {len(df_full)} rows")
+
+already_cached_ids = set(all_traces_combined.keys())
+cached_files = set(os.listdir("csvs/"))
+
+remaining = df_full[~df_full['log_id'].isin(already_cached_ids)].copy()
+print(f"Already cached: {len(already_cached_ids)}")
+print(f"Remaining uncached in the 3-month pool: {len(remaining)}")
+
+subtype_have = {}
+for d in all_traces_combined.values():
+    st = d.get('subtype')
+    subtype_have[st] = subtype_have.get(st, 0) + 1
+
+SAMPLES_PER_SUBTYPE = 15
+under_sampled = [st for st in remaining['activity_subtype'].unique() if subtype_have.get(st, 0) < SAMPLES_PER_SUBTYPE]
+to_sample = remaining[remaining['activity_subtype'].isin(under_sampled)].copy()
+to_sample['has_raw_cached'] = to_sample.apply(
+    lambda r: f"{r['user_id']}-{r['date_str']}-packets.csv" in cached_files, axis=1
+)
+to_sample = to_sample.sort_values('has_raw_cached', ascending=False)
+
+df_new_batch = to_sample.groupby('activity_subtype').head(SAMPLES_PER_SUBTYPE).sample(
+    n=min(150, len(to_sample)), random_state=int(time.time())
+)
+print(f"Selected {len(df_new_batch)} new rows (guaranteed not already cached)")
+print(f"Unique user-days: {df_new_batch[['user_id','date_str']].drop_duplicates().shape[0]}")
+
+
+
+
+
+
+
+import requests
+from dotenv import load_dotenv
+
+load_dotenv(override=True)
+REDASH_BASE_URL = os.getenv("REDASH_BASE_URL", "https://redash.t.pw").rstrip("/")
+REDASH_API_KEY = os.getenv("REDASH_API_KEY", "")
+BubbleAppCookie = os.getenv("BubbleAppCookie", "")
+BROWSER_USER_AGENT = os.getenv("FW_DS_USER_AGENT", "")
+headers = {"Authorization": f"Key {REDASH_API_KEY}", "User-Agent": BROWSER_USER_AGENT}
+cookies = {"BubbleAppCookie": BubbleAppCookie}
+
+resp = requests.post(f"{REDASH_BASE_URL}/api/query_results", headers=headers, cookies=cookies,
+                      json={"query": "SELECT 1 AS test", "data_source_id": 44}, timeout=30)
+print("Auth OK" if "application/json" in resp.headers.get("Content-Type","") else "COOKIE STALE - refresh first!")
+
+
+
+
+
+
+
+
+
+
+
+import shutil, subprocess, threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+BASE_DIR = "/Users/arushbhatnagar/Downloads/fw-ds"
+N_WORKERS = 6
+worker_locks = {i: threading.Lock() for i in range(N_WORKERS)}
+
+def process_row_parallel_locked(args):
+    row, worker_id = args
+    worker_dir = f"{BASE_DIR}_worker{worker_id}"
+    if not os.path.exists(worker_dir):
+        shutil.copytree(BASE_DIR, worker_dir, ignore=shutil.ignore_patterns('csvs', '.venv', '.git', '*_worker*'))
+        os.symlink(f"{BASE_DIR}/csvs", f"{worker_dir}/csvs")
+        os.symlink(f"{BASE_DIR}/.venv", f"{worker_dir}/.venv")
+    debug_path = f"{worker_dir}/firmware/debug/workout-detection.csv"
+    with worker_locks[worker_id]:
+        call_start_time = time.time()
+        result = subprocess.run(
+            [f"{worker_dir}/.venv/bin/python", "simulate.py", row['user_id'], row['date_str']],
+            capture_output=True, text=True, cwd=worker_dir, env=os.environ.copy()
+        )
+        if result.returncode != 0:
+            combined_output = (result.stdout + result.stderr)[-500:]
+            if "non_json_response" in combined_output or "sign-in" in combined_output:
+                return row['log_id'], None, "AUTH_STALE"
+            return row['log_id'], None, "OTHER_FAIL"
+        if not os.path.exists(debug_path) or os.path.getsize(debug_path) < 1000:
+            return row['log_id'], None, "EMPTY_OR_TINY_DEBUG_FILE"
+        if os.path.getmtime(debug_path) < call_start_time:
+            return row['log_id'], None, "STALE_DEBUG_FILE"
+        try:
+            dbg = pd.read_csv(debug_path)
+        except Exception:
+            return row['log_id'], None, "UNREADABLE_DEBUG_FILE"
+        start_ms, end_ms = int(row['start_time_ms']), int(row['end_time_ms'])
+        win = dbg[(dbg['timestamp'] >= start_ms - 60_000) & (dbg['timestamp'] <= end_ms + 60_000)]
+        if len(win) == 0:
+            return row['log_id'], None, "NO_MATCHING_WINDOW"
+        return row['log_id'], {'window': win, 'label': None, 'subtype': row['activity_subtype']}, None
+
+tasks = [(row, i % N_WORKERS) for i, (_, row) in enumerate(df_new_batch.iterrows())]
+new_traces = {}
+skip_reasons = {}
+start_time = time.time()
+
+with ThreadPoolExecutor(max_workers=N_WORKERS) as ex:
+    futures = {ex.submit(process_row_parallel_locked, t): t for t in tasks}
+    completed_count = 0
+    for fut in as_completed(futures):
+        log_id, data, err = fut.result()
+        completed_count += 1
+        elapsed = round(time.time() - start_time, 1)
+        if err == "AUTH_STALE":
+            print(f"[{elapsed}s] AUTH STALE - refresh cookie", flush=True)
+        elif data is not None:
+            new_traces[log_id] = data
+            print(f"[{elapsed}s] ({completed_count}/{len(tasks)}) OK: {log_id[:12]}...", flush=True)
+        else:
+            skip_reasons[err] = skip_reasons.get(err, 0) + 1
+            print(f"[{elapsed}s] ({completed_count}/{len(tasks)}) skipped: {err}", flush=True)
+        if completed_count % 10 == 0:
+            combined_so_far = {**all_traces_combined, **new_traces}
+            with open("all_traces_combined.pkl", "wb") as f:
+                pickle.dump(combined_so_far, f)
+            print(f"  -> Checkpoint: {len(new_traces)} new | skips: {skip_reasons}", flush=True)
+
+all_traces_combined = {**all_traces_combined, **new_traces}
+with open("all_traces_combined.pkl", "wb") as f:
+    pickle.dump(all_traces_combined, f)
+print(f"\nDONE. New: {len(new_traces)}. Combined total: {len(all_traces_combined)}")
